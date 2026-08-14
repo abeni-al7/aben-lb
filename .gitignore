@@ -1,0 +1,9 @@
+.specify
+.github
+
+*.md
+
+# Do not ignore README.md
+!README.md
+
+.env
