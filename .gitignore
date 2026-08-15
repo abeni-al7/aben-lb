@@ -1,5 +1,6 @@
 .specify
-.github
+.github/*
+!.github/workflows/
 
 *.md
 
@@ -7,3 +8,8 @@
 !README.md
 
 .env
+
+# Go build and test artifacts
+/bin/
+*.test
+coverage.out
