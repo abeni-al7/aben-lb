@@ -60,7 +60,7 @@ func (b *lockedBuffer) String() string {
 
 // process is a running lb or be command with captured standard output.
 type process struct {
-	t      *testing.T
+	t      testing.TB
 	cmd    *exec.Cmd
 	stdout *lockedBuffer
 	stderr *lockedBuffer
@@ -70,7 +70,7 @@ type process struct {
 
 // startProcess starts a built command with args, captures its output, and
 // guarantees the process is terminated when the test finishes.
-func startProcess(t *testing.T, name string, args ...string) *process {
+func startProcess(t testing.TB, name string, args ...string) *process {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(binDir, name), args...)
 	stdout := &lockedBuffer{}
@@ -147,7 +147,7 @@ func (p *process) waitForOutput(substr string, timeout time.Duration) {
 
 // freeLoopbackAddr reserves and releases an ephemeral loopback address so
 // process tests never depend on fixed ports.
-func freeLoopbackAddr(t *testing.T) string {
+func freeLoopbackAddr(t testing.TB) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

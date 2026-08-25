@@ -73,6 +73,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.logf("event=request client=%s method=%s target=%s proto=%s", r.RemoteAddr, r.Method, r.RequestURI, r.Proto)
+	// Drain the request body so closing the connection never resets the
+	// client with unread bytes still buffered.
+	io.Copy(io.Discard, r.Body)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, ResponseBody)

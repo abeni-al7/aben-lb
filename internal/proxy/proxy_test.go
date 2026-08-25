@@ -3,12 +3,14 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -458,6 +460,477 @@ func TestUnsupportedSyntaxRejected(t *testing.T) {
 	}
 	if recorded := backend.recorded(t); len(recorded) != 0 {
 		t.Fatalf("malformed request reached backend %d time(s)", len(recorded))
+	}
+}
+
+// startMixedBackend serves the concurrency scenarios by path: token echo,
+// body echo, delayed responses, held response headers, client errors,
+// abrupt closure for gateway errors, and slow flushed streaming.
+func startMixedBackend(t *testing.T, heldArrived chan<- struct{}) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			io.WriteString(w, "token="+r.Header.Get("X-Token"))
+		case "/echo":
+			body, _ := io.ReadAll(r.Body)
+			w.Write(body)
+		case "/slow-response":
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			io.WriteString(w, "slow="+r.Header.Get("X-Token"))
+		case "/held":
+			if heldArrived != nil {
+				heldArrived <- struct{}{}
+			}
+			// Send no response headers until the proxy or client gives up.
+			select {
+			case <-time.After(20 * time.Second):
+			case <-r.Context().Done():
+			}
+		case "/client-error":
+			http.Error(w, "no such thing", http.StatusNotFound)
+		case "/gateway":
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack gateway connection: %v", err)
+				return
+			}
+			conn.Close()
+		case "/stream":
+			flusher := w.(http.Flusher)
+			for i := 0; i < 20; i++ {
+				if _, err := io.WriteString(w, strings.Repeat("s", 1024)); err != nil {
+					return
+				}
+				flusher.Flush()
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
+			}
+		default:
+			io.WriteString(w, "default")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// tokenGet sends one one-shot GET with a unique token and returns the
+// response status and body.
+func tokenGet(t *testing.T, addr, path, token string) (int, string, error) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Token", token)
+	resp, err := oneShotClient().Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.StatusCode, string(body), nil
+}
+
+// TestConcurrentMixedOutcomes runs slow request bodies, slow backend
+// responses, successes, client errors, gateway errors, and client
+// disconnects at the same time and expects every unrelated request to
+// finish with its own uncontaminated outcome (FR-008, FR-009, FR-010).
+func TestConcurrentMixedOutcomes(t *testing.T) {
+	backendSrv := startMixedBackend(t, nil)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 128)
+	fail := func(format string, args ...any) {
+		errs <- fmt.Errorf(format, args...)
+	}
+
+	for i := 0; i < 10; i++ {
+		token := fmt.Sprintf("ok-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", token)
+			if err != nil {
+				fail("success request %s: %v", token, err)
+				return
+			}
+			if status != http.StatusOK || body != "token="+token {
+				fail("success request %s got status=%d body=%q", token, status, body)
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		token := fmt.Sprintf("slow-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status, body, err := tokenGet(t, proxySrv.Addr(), "/slow-response", token)
+			if err != nil {
+				fail("slow response %s: %v", token, err)
+				return
+			}
+			if status != http.StatusOK || body != "slow="+token {
+				fail("slow response %s got status=%d body=%q", token, status, body)
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		token := fmt.Sprintf("slowbody-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Stream the request body slowly across several writes.
+			pr, pw := io.Pipe()
+			go func() {
+				for j := 0; j < 4; j++ {
+					io.WriteString(pw, token)
+					time.Sleep(50 * time.Millisecond)
+				}
+				pw.Close()
+			}()
+			req, err := http.NewRequest(http.MethodPost, "http://"+proxySrv.Addr()+"/echo", pr)
+			if err != nil {
+				fail("build slow-body request: %v", err)
+				return
+			}
+			req.ContentLength = int64(4 * len(token))
+			resp, err := oneShotClient().Do(req)
+			if err != nil {
+				fail("slow body %s: %v", token, err)
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != strings.Repeat(token, 4) {
+				fail("slow body %s got status=%d body=%q err=%v", token, resp.StatusCode, body, err)
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		token := fmt.Sprintf("err-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status, _, err := tokenGet(t, proxySrv.Addr(), "/client-error", token)
+			if err != nil {
+				fail("client error request %s: %v", token, err)
+				return
+			}
+			if status != http.StatusNotFound {
+				fail("client error request %s got status=%d, want 404", token, status)
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		token := fmt.Sprintf("gw-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			status, _, err := tokenGet(t, proxySrv.Addr(), "/gateway", token)
+			if err != nil {
+				fail("gateway request %s: %v", token, err)
+				return
+			}
+			if status < 500 {
+				fail("gateway request %s got status=%d, want a 5xx gateway error", token, status)
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Disconnect while awaiting the response.
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxySrv.Addr()+"/held", nil)
+			if err != nil {
+				fail("build disconnect request: %v", err)
+				return
+			}
+			resp, err := oneShotClient().Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", "after-mixed")
+	if err != nil || status != http.StatusOK || body != "token=after-mixed" {
+		t.Fatalf("proxy unavailable after mixed outcomes: status=%d body=%q err=%v", status, body, err)
+	}
+}
+
+// TestHeldRequestOrdering holds one backend request without response headers
+// for the full five-second timeout while 99 independent requests run, and
+// expects every fast request to finish before the held request does with at
+// least 95% completing within one second (SC-004).
+func TestHeldRequestOrdering(t *testing.T) {
+	heldArrived := make(chan struct{}, 1)
+	backendSrv := startMixedBackend(t, heldArrived)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	heldDone := make(chan time.Time, 1)
+	go func() {
+		status, _, err := tokenGet(t, proxySrv.Addr(), "/held", "held")
+		if err == nil && status < 500 {
+			t.Errorf("held request got status=%d, want a 5xx gateway error", status)
+		}
+		heldDone <- time.Now()
+	}()
+
+	select {
+	case <-heldArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held request never reached the backend")
+	}
+
+	start := time.Now()
+	type fastResult struct {
+		finished time.Time
+		err      error
+	}
+	results := make(chan fastResult, 99)
+	for i := 0; i < 99; i++ {
+		token := fmt.Sprintf("fast-%d", i)
+		go func() {
+			status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", token)
+			if err == nil && (status != http.StatusOK || body != "token="+token) {
+				err = fmt.Errorf("status=%d body=%q", status, body)
+			}
+			results <- fastResult{finished: time.Now(), err: err}
+		}()
+	}
+
+	withinOneSecond := 0
+	var latestFast time.Time
+	for i := 0; i < 99; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("fast request failed behind held request: %v", r.err)
+			continue
+		}
+		if r.finished.Sub(start) <= time.Second {
+			withinOneSecond++
+		}
+		if r.finished.After(latestFast) {
+			latestFast = r.finished
+		}
+	}
+	if withinOneSecond < 95 {
+		t.Errorf("only %d/99 fast requests finished within 1s of start", withinOneSecond)
+	}
+
+	heldFinished := <-heldDone
+	if elapsed := heldFinished.Sub(start); elapsed < 4*time.Second {
+		t.Errorf("held request finished after %v, want the full five-second timeout", elapsed)
+	}
+	if !latestFast.Before(heldFinished) {
+		t.Errorf("fast requests finished at %v, after the held request at %v", latestFast, heldFinished)
+	}
+}
+
+// TestClientDisconnectStages disconnects clients before parsing, during
+// request-body forwarding, while awaiting response headers, and during
+// response-body relay; a concurrent unrelated request must succeed during
+// each stage and the proxy must stay available afterward (FR-026).
+func TestClientDisconnectStages(t *testing.T) {
+	heldArrived := make(chan struct{}, 4)
+	backendSrv := startMixedBackend(t, heldArrived)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	assertUnrelatedSucceeds := func(stage string) {
+		t.Helper()
+		status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", stage)
+		if err != nil || status != http.StatusOK || body != "token="+stage {
+			t.Fatalf("unrelated request during %s: status=%d body=%q err=%v", stage, status, body, err)
+		}
+	}
+
+	dial := func() net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", proxySrv.Addr(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		return conn
+	}
+
+	t.Run("before parsing", func(t *testing.T) {
+		conn := dial()
+		io.WriteString(conn, "GET /nev") // partial request line, then vanish
+		conn.Close()
+		assertUnrelatedSucceeds("before-parsing")
+	})
+
+	t.Run("during request body forwarding", func(t *testing.T) {
+		conn := dial()
+		io.WriteString(conn, "POST /echo HTTP/1.1\r\nHost: dc.test\r\nContent-Length: 4096\r\n\r\npartial-body")
+		time.Sleep(50 * time.Millisecond)
+		conn.Close()
+		assertUnrelatedSucceeds("during-body")
+	})
+
+	t.Run("while awaiting response headers", func(t *testing.T) {
+		conn := dial()
+		io.WriteString(conn, "GET /held HTTP/1.1\r\nHost: dc.test\r\n\r\n")
+		select {
+		case <-heldArrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("held request never reached the backend")
+		}
+		conn.Close()
+		assertUnrelatedSucceeds("awaiting-headers")
+	})
+
+	t.Run("during response body relay", func(t *testing.T) {
+		conn := dial()
+		io.WriteString(conn, "GET /stream HTTP/1.1\r\nHost: dc.test\r\n\r\n")
+		// Read part of the streamed response, then vanish mid-relay.
+		buf := make([]byte, 512)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			t.Fatalf("read start of streamed response: %v", err)
+		}
+		conn.Close()
+		assertUnrelatedSucceeds("during-relay")
+	})
+
+	status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", "after-disconnects")
+	if err != nil || status != http.StatusOK || body != "token=after-disconnects" {
+		t.Fatalf("proxy unavailable after disconnect stages: status=%d body=%q err=%v", status, body, err)
+	}
+}
+
+// TestResponseReordering expects a later fast request to complete before an
+// earlier slow request, and each client to receive only its own response.
+func TestResponseReordering(t *testing.T) {
+	backendSrv := startMixedBackend(t, nil)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	slowDone := make(chan time.Time, 1)
+	go func() {
+		status, body, err := tokenGet(t, proxySrv.Addr(), "/slow-response", "reorder-slow")
+		if err != nil || status != http.StatusOK || body != "slow=reorder-slow" {
+			t.Errorf("slow request: status=%d body=%q err=%v", status, body, err)
+		}
+		slowDone <- time.Now()
+	}()
+
+	// Give the slow request time to reach the backend first.
+	time.Sleep(100 * time.Millisecond)
+	status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", "reorder-fast")
+	fastDone := time.Now()
+	if err != nil || status != http.StatusOK || body != "token=reorder-fast" {
+		t.Fatalf("fast request: status=%d body=%q err=%v", status, body, err)
+	}
+	if slowFinished := <-slowDone; !fastDone.Before(slowFinished) {
+		t.Fatalf("fast request finished at %v, after slow request at %v", fastDone, slowFinished)
+	}
+}
+
+// TestAbove100ConnectionsIntegrity runs 150 simultaneous clients and expects
+// no crash, no corrupted or cross-contaminated responses, at least 100
+// successes, and continued availability (FR-008, FR-027).
+func TestAbove100ConnectionsIntegrity(t *testing.T) {
+	backendSrv := startMixedBackend(t, nil)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	const clients = 150
+	var wg sync.WaitGroup
+	var successes atomic.Int64
+	mismatches := make(chan string, clients)
+	release := make(chan struct{})
+	for i := 0; i < clients; i++ {
+		token := fmt.Sprintf("above-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-release
+			status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", token)
+			if err != nil {
+				return // above 100, refusal is allowed but corruption is not
+			}
+			if status != http.StatusOK || body != "token="+token {
+				mismatches <- fmt.Sprintf("token %s got status=%d body=%q", token, status, body)
+				return
+			}
+			successes.Add(1)
+		}()
+	}
+	close(release)
+	wg.Wait()
+	close(mismatches)
+	for m := range mismatches {
+		t.Errorf("corrupted response above 100 connections: %s", m)
+	}
+	if got := successes.Load(); got < 100 {
+		t.Errorf("only %d/%d simultaneous requests succeeded, want at least 100", got, clients)
+	}
+
+	status, body, err := tokenGet(t, proxySrv.Addr(), "/ok", "after-above100")
+	if err != nil || status != http.StatusOK || body != "token=after-above100" {
+		t.Fatalf("proxy unavailable after 150-connection burst: status=%d body=%q err=%v", status, body, err)
+	}
+}
+
+// TestPerClientDataIsolation posts a unique body from each of 100 concurrent
+// clients and expects every client to receive exactly its own echo (FR-009).
+func TestPerClientDataIsolation(t *testing.T) {
+	backendSrv := startMixedBackend(t, nil)
+	proxySrv := startProxy(t, backendSrv.URL)
+
+	const clients = 100
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+	for i := 0; i < clients; i++ {
+		payload := fmt.Sprintf("isolated-payload-%03d-%s", i, strings.Repeat(fmt.Sprintf("%02x", i), 64))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := oneShotClient().Post(
+				"http://"+proxySrv.Addr()+"/echo", "text/plain", strings.NewReader(payload))
+			if err != nil {
+				errs <- fmt.Errorf("post %q: %w", payload[:20], err)
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				errs <- fmt.Errorf("read echo for %q: %w", payload[:20], err)
+				return
+			}
+			if string(body) != payload {
+				errs <- fmt.Errorf("client received foreign data: want %q, got %q", payload[:20], string(body))
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
 

@@ -58,9 +58,15 @@ func (s *Server) Start() error {
 // newReverseProxy forwards requests to the configured backend origin while
 // preserving the raw target, host, end-to-end headers, and body.
 func (s *Server) newReverseProxy() *httputil.ReverseProxy {
+	// One transport is shared by every request; it is concurrency-safe,
+	// keeps per-request forwarding state independent, and pools enough idle
+	// backend connections for 100 simultaneous clients without churn.
+	const maxPooledBackendConns = 128
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: backendTimeout}).DialContext,
 		ResponseHeaderTimeout: backendTimeout,
+		MaxIdleConns:          maxPooledBackendConns,
+		MaxIdleConnsPerHost:   maxPooledBackendConns,
 	}
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -78,6 +84,15 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 			}
 		},
 		Transport: transport,
+		// Forwarding failures stay isolated to their own request: a client
+		// that is already gone gets no response, and any other failure gets
+		// a generated 502 while unrelated connections continue untouched.
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if r.Context().Err() != nil {
+				return
+			}
+			w.WriteHeader(http.StatusBadGateway)
+		},
 	}
 }
 
