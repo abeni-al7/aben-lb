@@ -956,3 +956,168 @@ func TestOneResponsePerConnection(t *testing.T) {
 		t.Fatalf("backend received %d requests, want 1", len(recorded))
 	}
 }
+
+// assertGeneratedError verifies the exact generated error contract: status
+// line, exact plain-text body, content metadata, no leaked internals, and
+// connection closure (FR-014, FR-015, FR-028).
+func assertGeneratedError(t *testing.T, raw string, status int, statusText, body string) {
+	t.Helper()
+	wantLine := fmt.Sprintf("HTTP/1.1 %d %s", status, statusText)
+	if !strings.HasPrefix(raw, wantLine) {
+		t.Fatalf("status line does not start with %q:\n%s", wantLine, raw)
+	}
+	head, gotBody, found := strings.Cut(raw, "\r\n\r\n")
+	if !found {
+		t.Fatalf("response has no header terminator:\n%s", raw)
+	}
+	if gotBody != body {
+		t.Fatalf("body = %q, want exactly %q", gotBody, body)
+	}
+	lowerHead := strings.ToLower(head)
+	if !strings.Contains(lowerHead, "content-type: text/plain; charset=utf-8") {
+		t.Fatalf("missing plain-text content type:\n%s", head)
+	}
+	if !strings.Contains(lowerHead, fmt.Sprintf("content-length: %d", len(body))) {
+		t.Fatalf("missing exact content length %d:\n%s", len(body), head)
+	}
+	for _, leak := range []string{"refused", "dial", "tcp", "EOF", "127.0.0.1", "timeout awaiting"} {
+		if strings.Contains(gotBody, leak) {
+			t.Fatalf("generated body leaks internals %q: %q", leak, gotBody)
+		}
+	}
+}
+
+// assertOutcomeClass waits for one error outcome record with the given
+// stable class and, when non-zero, the given status field.
+func assertOutcomeClass(t *testing.T, out *logBuffer, class string, status int) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, rec := range recordsWithEvent(out.String(), "error") {
+			if recordField(t, rec, "class") != class {
+				continue
+			}
+			if status != 0 && recordField(t, rec, "status") != fmt.Sprintf("%d", status) {
+				continue
+			}
+			return rec
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no error record with class=%s status=%d; logs:\n%s", class, status, out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestBackendConnectionRefusedProducesBadGateway expects a refused backend
+// connection to produce the exact generated 502 with a stable
+// backend_connection failure class and correlated request ID (FR-014).
+func TestBackendConnectionRefusedProducesBadGateway(t *testing.T) {
+	// Reserve an address, then close it so connections are refused.
+	ln := newEphemeralListener(t)
+	backendAddr := ln.Addr().String()
+	ln.Close()
+	proxySrv, out := startObservedProxy(t, "http://"+backendAddr)
+
+	start := time.Now()
+	raw := rawHTTPExchange(t, proxySrv.Addr(), "GET / HTTP/1.1\r\nHost: refused.test\r\n\r\n")
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("502 arrived after %v, want within 5s", elapsed)
+	}
+	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
+
+	rec := assertOutcomeClass(t, out, "backend_connection", http.StatusBadGateway)
+	requests := recordsWithEvent(out.String(), "request")
+	if len(requests) != 1 {
+		t.Fatalf("got %d request records, want 1; logs:\n%s", len(requests), out.String())
+	}
+	if recordField(t, rec, "id") != recordField(t, requests[0], "id") {
+		t.Fatalf("outcome ID does not match request ID:\n%q\n%q", requests[0], rec)
+	}
+}
+
+// TestBackendEarlyCloseProducesBadGateway expects a backend that closes
+// before sending complete response headers to produce the exact 502 with a
+// backend_response class (FR-014).
+func TestBackendEarlyCloseProducesBadGateway(t *testing.T) {
+	ln := startScriptedBackend(t, "") // reads the request, then closes
+	proxySrv, out := startObservedProxy(t, "http://"+ln.Addr().String())
+
+	raw := rawHTTPExchange(t, proxySrv.Addr(), "GET / HTTP/1.1\r\nHost: early.test\r\n\r\n")
+	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
+	assertOutcomeClass(t, out, "backend_response", http.StatusBadGateway)
+}
+
+// TestMalformedBackendResponseProducesBadGateway expects a syntactically
+// invalid backend status line to produce the exact 502 with a
+// backend_response class (FR-014).
+func TestMalformedBackendResponseProducesBadGateway(t *testing.T) {
+	ln := startScriptedBackend(t, "BOGUS/9.9 banana\r\n\r\n")
+	proxySrv, out := startObservedProxy(t, "http://"+ln.Addr().String())
+
+	raw := rawHTTPExchange(t, proxySrv.Addr(), "GET / HTTP/1.1\r\nHost: malformed.test\r\n\r\n")
+	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
+	assertOutcomeClass(t, out, "backend_response", http.StatusBadGateway)
+}
+
+// TestSilentBackendProducesGatewayTimeout expects a connected backend that
+// sends no response headers to produce the exact 504 five seconds after the
+// request is fully sent, classified as backend_timeout (FR-015, SC-005).
+func TestSilentBackendProducesGatewayTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("five-second timeout scenario skipped in short mode")
+	}
+	ln := startSilentBackend(t)
+	proxySrv, out := startObservedProxy(t, "http://"+ln.Addr().String())
+
+	start := time.Now()
+	raw := rawHTTPExchange(t, proxySrv.Addr(), "GET / HTTP/1.1\r\nHost: silent.test\r\n\r\n")
+	elapsed := time.Since(start)
+	if elapsed < 4500*time.Millisecond || elapsed > 8*time.Second {
+		t.Fatalf("504 arrived after %v, want the five-second response-header deadline", elapsed)
+	}
+	assertGeneratedError(t, raw, http.StatusGatewayTimeout, "Gateway Timeout", "Gateway Timeout\n")
+
+	rec := assertOutcomeClass(t, out, "backend_timeout", http.StatusGatewayTimeout)
+	requests := recordsWithEvent(out.String(), "request")
+	if len(requests) != 1 {
+		t.Fatalf("got %d request records, want 1; logs:\n%s", len(requests), out.String())
+	}
+	if recordField(t, rec, "id") != recordField(t, requests[0], "id") {
+		t.Fatalf("outcome ID does not match request ID:\n%q\n%q", requests[0], rec)
+	}
+}
+
+// TestGatewayErrorsKeepServiceAvailable expects gateway failures to leave
+// the proxy fully available to later requests against a healthy backend
+// (FR-010).
+func TestGatewayErrorsKeepServiceAvailable(t *testing.T) {
+	backend := &echoBackend{respBody: []byte("still-alive")}
+	backendSrv := backend.start(t)
+	proxySrv, out := startObservedProxy(t, backendSrv.URL)
+
+	// A proxy whose backend refuses connections keeps answering with 502.
+	refusedLn := newEphemeralListener(t)
+	refusedAddr := refusedLn.Addr().String()
+	refusedLn.Close()
+	refusedProxy, refusedOut := startObservedProxy(t, "http://"+refusedAddr)
+	raw := rawHTTPExchange(t, refusedProxy.Addr(), "GET / HTTP/1.1\r\nHost: down.test\r\n\r\n")
+	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
+	assertOutcomeClass(t, refusedOut, "backend_connection", http.StatusBadGateway)
+
+	// The healthy proxy still serves, and the failed proxy still answers.
+	resp, err := oneShotClient().Get("http://" + proxySrv.Addr() + "/")
+	if err != nil {
+		t.Fatalf("healthy proxy unavailable: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "still-alive" {
+		t.Fatalf("healthy relay status=%d body=%q", resp.StatusCode, body)
+	}
+	raw = rawHTTPExchange(t, refusedProxy.Addr(), "GET / HTTP/1.1\r\nHost: down.test\r\n\r\n")
+	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
+	if got := len(recordsWithEvent(out.String(), "error")); got != 0 {
+		t.Fatalf("healthy proxy logged %d unrelated error records; logs:\n%s", got, out.String())
+	}
+}
