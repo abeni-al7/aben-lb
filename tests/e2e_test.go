@@ -216,3 +216,93 @@ func TestMalformedRequestsEndToEnd(t *testing.T) {
 	default:
 	}
 }
+
+// TestCrossStoryRegressionsEndToEnd exercises success, secret-bearing, and
+// failure traffic against the real binaries, then interrupts both processes.
+// It asserts no secret reaches either process's standard output, generated
+// errors disclose no internals, every connection closes, and both processes
+// drain and exit cleanly (cross-story regression for US1-US3).
+func TestCrossStoryRegressionsEndToEnd(t *testing.T) {
+	beAddr := freeLoopbackAddr(t)
+	be := startProcess(t, "be", "-listen", beAddr)
+	be.waitForOutput(beAddr, 5*time.Second)
+
+	lbAddr := freeLoopbackAddr(t)
+	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr)
+	lb.waitForOutput(lbAddr, 5*time.Second)
+
+	// Secret-bearing success request through the running binaries.
+	secrets := []string{"e2e-path-secret", "e2e-query-secret", "e2e-header-secret", "e2e-body-secret"}
+	req, err := http.NewRequest(http.MethodPost,
+		"http://"+lbAddr+"/e2e-path-secret?k=e2e-query-secret",
+		strings.NewReader("e2e-body-secret"))
+	if err != nil {
+		t.Fatalf("build secret request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer e2e-header-secret")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("secret-bearing request: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Malformed request carrying a secret produces the exact 400 and closes.
+	raw := rawExchange(t, lbAddr, "INVALID e2e-query-secret\r\nX-Key: e2e-header-secret\r\n\r\n", false)
+	assertExactBadRequest(t, raw)
+
+	// A proxy with a down backend generates a 502 without disclosure.
+	downAddr := freeLoopbackAddr(t)
+	lbDownAddr := freeLoopbackAddr(t)
+	lbDown := startProcess(t, "lb", "-listen", lbDownAddr, "-backend", "http://"+downAddr)
+	lbDown.waitForOutput(lbDownAddr, 5*time.Second)
+	raw = rawExchange(t, lbDownAddr, "GET / HTTP/1.1\r\nHost: down.test\r\n\r\n", false)
+	if !strings.HasPrefix(raw, "HTTP/1.1 502 Bad Gateway") {
+		t.Fatalf("down-backend response is not the generated 502:\n%q", raw)
+	}
+	lowerRaw := strings.ToLower(raw)
+	for _, leak := range []string{strings.ToLower(downAddr), "dial tcp", "connection refused", "goroutine"} {
+		if strings.Contains(lowerRaw, leak) {
+			t.Errorf("generated 502 discloses %q:\n%s", leak, raw)
+		}
+	}
+	if !strings.Contains(lowerRaw, "connection: close") {
+		t.Errorf("generated 502 does not advertise closure:\n%s", raw)
+	}
+
+	// One-response connection closure: a second pipelined request is ignored.
+	oneRequest := "GET / HTTP/1.1\r\nHost: close.test\r\n\r\n"
+	raw = rawExchange(t, lbAddr, oneRequest+oneRequest, false)
+	if got := strings.Count(raw, "HTTP/1.1 "); got != 1 {
+		t.Fatalf("connection produced %d responses, want exactly 1:\n%s", got, raw)
+	}
+
+	// Secrets never reach the load balancer's diagnostics. The test backend
+	// intentionally logs full request details, so it is not asserted here.
+	waitForLogField(t, lb, "class=invalid_request")
+	for _, secret := range secrets {
+		for _, p := range []struct {
+			name string
+			out  string
+		}{{"lb", lb.output()}, {"lb-down", lbDown.output()}} {
+			if strings.Contains(p.out, secret) {
+				t.Errorf("secret %q leaked into %s stdout:\n%s", secret, p.name, p.out)
+			}
+		}
+	}
+
+	// Graceful interrupt: every process drains, logs shutdown, and exits 0.
+	for _, p := range []struct {
+		name string
+		proc *process
+	}{{"lb", lb}, {"lb-down", lbDown}, {"be", be}} {
+		p.proc.interrupt()
+		if err := p.proc.await(7 * time.Second); err != nil {
+			t.Errorf("%s exited with error after interrupt: %v\nstderr:\n%s",
+				p.name, err, p.proc.errorOutput())
+		}
+		if !strings.Contains(p.proc.output(), "event=shutdown") {
+			t.Errorf("%s did not record shutdown; output:\n%s", p.name, p.proc.output())
+		}
+	}
+}

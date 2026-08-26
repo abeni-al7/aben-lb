@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1119,5 +1120,110 @@ func TestGatewayErrorsKeepServiceAvailable(t *testing.T) {
 	assertGeneratedError(t, raw, http.StatusBadGateway, "Bad Gateway", "Bad Gateway\n")
 	if got := len(recordsWithEvent(out.String(), "error")); got != 0 {
 		t.Fatalf("healthy proxy logged %d unrelated error records; logs:\n%s", got, out.String())
+	}
+}
+
+// TestGeneratedErrorsDoNotDiscloseInternals is a cross-story regression: the
+// complete generated 400 and 502 responses, headers included, must close the
+// connection and never disclose the backend address, raw network errors, or
+// Go runtime internals (FR-014, FR-028).
+func TestGeneratedErrorsDoNotDiscloseInternals(t *testing.T) {
+	ln := newEphemeralListener(t)
+	backendAddr := ln.Addr().String()
+	ln.Close()
+	proxySrv := startProxy(t, "http://"+backendAddr)
+
+	cases := []struct {
+		name       string
+		request    string
+		wantStatus string
+	}{
+		{"malformed request", "INVALID REQUEST\r\nBroken\r\n\r\n", "HTTP/1.1 400"},
+		{"refused backend", "GET / HTTP/1.1\r\nHost: internals.test\r\n\r\n", "HTTP/1.1 502"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// rawHTTPExchange reads to EOF, so returning proves closure.
+			raw := rawHTTPExchange(t, proxySrv.Addr(), tc.request)
+			if !strings.HasPrefix(raw, tc.wantStatus) {
+				t.Fatalf("response does not start with %q:\n%s", tc.wantStatus, raw)
+			}
+			if !strings.Contains(strings.ToLower(raw), "connection: close") {
+				t.Errorf("generated error does not advertise closure:\n%s", raw)
+			}
+			lower := strings.ToLower(raw)
+			for _, leak := range []string{
+				strings.ToLower(backendAddr),
+				"dial tcp", "connection refused", "goroutine", "runtime error",
+				"net/http", ".go:",
+			} {
+				if strings.Contains(lower, leak) {
+					t.Errorf("generated error discloses %q:\n%s", leak, raw)
+				}
+			}
+		})
+	}
+}
+
+// TestGoroutineCleanupAfterMixedLoad is a cross-story regression: after
+// successes, generated errors, and client disconnects complete and the proxy
+// shuts down, no request-scoped goroutines may remain.
+func TestGoroutineCleanupAfterMixedLoad(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	backendSrv := startMixedBackend(t, nil)
+	cfg, err := NewConfig("127.0.0.1:0", backendSrv.URL)
+	if err != nil {
+		t.Fatalf("build proxy config: %v", err)
+	}
+	srv := NewServer(cfg, io.Discard)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			switch i % 4 {
+			case 0: // success
+				tokenGet(t, srv.Addr(), "/ok", fmt.Sprintf("clean-%d", i))
+			case 1: // backend gateway failure
+				tokenGet(t, srv.Addr(), "/gateway", fmt.Sprintf("clean-%d", i))
+			case 2: // malformed request
+				rawHTTPExchange(t, srv.Addr(), "INVALID REQUEST\r\n\r\n")
+			case 3: // client disconnect mid-request
+				conn, err := net.DialTimeout("tcp", srv.Addr(), 5*time.Second)
+				if err != nil {
+					return
+				}
+				io.WriteString(conn, "POST /echo HTTP/1.1\r\nHost: c.test\r\nContent-Length: 4096\r\n\r\npartial")
+				conn.Close()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown proxy: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var after int
+	for {
+		runtime.GC()
+		after = runtime.NumGoroutine()
+		if after <= before+2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if after > before+2 {
+		buf := make([]byte, 1<<20)
+		t.Fatalf("goroutines grew from %d to %d after shutdown:\n%s",
+			before, after, buf[:runtime.Stack(buf, true)])
 	}
 }

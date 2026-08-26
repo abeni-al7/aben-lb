@@ -37,6 +37,7 @@ type Server struct {
 
 	httpServer *http.Server
 	listener   net.Listener
+	transport  *http.Transport
 	done       chan error
 }
 
@@ -116,6 +117,7 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 		MaxIdleConns:          maxPooledBackendConns,
 		MaxIdleConnsPerHost:   maxPooledBackendConns,
 	}
+	s.transport = transport
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = s.cfg.BackendURL.Scheme
@@ -196,9 +198,12 @@ func (s *Server) Done() <-chan error {
 }
 
 // Shutdown stops accepting connections, drains active requests until ctx
-// expires, and records shutdown.
+// expires, releases pooled backend connections, and records shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.httpServer.Shutdown(ctx)
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
 	s.logf("event=shutdown role=load-balancer listen=%s", s.listener.Addr())
 	return err
 }

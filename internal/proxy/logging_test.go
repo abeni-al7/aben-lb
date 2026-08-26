@@ -327,3 +327,78 @@ func TestBodiesExcludedFromLogs(t *testing.T) {
 		}
 	}
 }
+
+// TestNoSecretLeakageAcrossOutcomes is a cross-story regression: secrets
+// carried in paths, queries, headers, and bodies must stay out of the
+// diagnostic stream on the success path (US1), under concurrency (US2), and
+// on the generated-error path (US3).
+func TestNoSecretLeakageAcrossOutcomes(t *testing.T) {
+	secrets := []string{
+		"leak-path-secret",
+		"leak-query-secret",
+		"leak-auth-secret",
+		"leak-cookie-secret",
+		"leak-body-secret",
+	}
+	sendSecrets := func(t *testing.T, addr string) {
+		t.Helper()
+		var wg sync.WaitGroup
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				req, err := http.NewRequest(http.MethodPost,
+					"http://"+addr+"/leak-path-secret?q=leak-query-secret",
+					strings.NewReader("leak-body-secret"))
+				if err != nil {
+					t.Errorf("build secret request: %v", err)
+					return
+				}
+				req.Header.Set("Authorization", "Bearer leak-auth-secret")
+				req.Header.Set("Cookie", "session=leak-cookie-secret")
+				resp, err := oneShotClient().Do(req)
+				if err != nil {
+					return // a refused backend fails at the client; logs still matter
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}()
+		}
+		wg.Wait()
+	}
+
+	t.Run("healthy backend", func(t *testing.T) {
+		backend := &echoBackend{respBody: []byte("ok")}
+		backendSrv := backend.start(t)
+		proxySrv, out := startObservedProxy(t, backendSrv.URL)
+		sendSecrets(t, proxySrv.Addr())
+		logs := out.String()
+		for _, secret := range secrets {
+			if strings.Contains(logs, secret) {
+				t.Errorf("secret %q leaked on the success path:\n%s", secret, logs)
+			}
+		}
+	})
+
+	t.Run("failing backend", func(t *testing.T) {
+		ln := newEphemeralListener(t)
+		refusedAddr := ln.Addr().String()
+		ln.Close()
+		proxySrv, out := startObservedProxy(t, "http://"+refusedAddr)
+		sendSecrets(t, proxySrv.Addr())
+		// Wait for every generated-error outcome so late records are checked.
+		deadline := time.Now().Add(5 * time.Second)
+		for len(recordsWithEvent(out.String(), "error")) < 5 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		logs := out.String()
+		if got := len(recordsWithEvent(logs, "error")); got < 5 {
+			t.Fatalf("got %d generated-error records, want 5; logs:\n%s", got, logs)
+		}
+		for _, secret := range secrets {
+			if strings.Contains(logs, secret) {
+				t.Errorf("secret %q leaked on the generated-error path:\n%s", secret, logs)
+			}
+		}
+	})
+}

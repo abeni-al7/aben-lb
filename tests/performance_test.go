@@ -116,9 +116,12 @@ func timedRequest(client *http.Client, baseURL string, kind perfKind) perfSample
 	}
 
 	start := time.Now()
-	wrote := start
+	// WroteRequest fires on the transport's write goroutine, so the
+	// timestamp crosses goroutines and must be atomic.
+	var wroteNanos atomic.Int64
+	wroteNanos.Store(start.UnixNano())
 	trace := &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) { wrote = time.Now() },
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteNanos.Store(time.Now().UnixNano()) },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
@@ -128,7 +131,7 @@ func timedRequest(client *http.Client, baseURL string, kind perfKind) perfSample
 	}
 	respBody, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	elapsed := time.Since(wrote)
+	elapsed := time.Since(time.Unix(0, wroteNanos.Load()))
 	ok := err == nil && resp.StatusCode == http.StatusOK && string(respBody) == expectedBackendBody
 	return perfSample{kind: kind, elapsed: elapsed, ok: ok}
 }
