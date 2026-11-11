@@ -1,5 +1,5 @@
-// Package proxy implements configuration, logging, and forwarding for the
-// single-backend HTTP/1.1 reverse proxy.
+// Package proxy implements configuration, logging, health checking, and
+// forwarding for the round-robin HTTP/1.1 load balancer.
 package proxy
 
 import (
@@ -14,6 +14,9 @@ import (
 const (
 	DefaultHealthInterval = 10 * time.Second
 	DefaultHealthPath     = "/"
+	// DefaultKeepAliveTimeout is how long an idle client connection is kept
+	// open waiting for its next request.
+	DefaultKeepAliveTimeout = 30 * time.Second
 )
 
 // Config is the immutable, validated startup configuration for the proxy.
@@ -28,6 +31,19 @@ type Config struct {
 	// HealthPath is the path requested with GET on each backend; only a
 	// 200 response counts as healthy.
 	HealthPath string
+	// KeepAliveTimeout is how long an idle client connection stays open for
+	// another request. Zero disables client keep-alive: every connection
+	// then carries exactly one request and closes.
+	KeepAliveTimeout time.Duration
+}
+
+// SetKeepAliveTimeout validates and applies the client keep-alive timeout.
+func (c *Config) SetKeepAliveTimeout(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("keep-alive timeout must not be negative, got %v", d)
+	}
+	c.KeepAliveTimeout = d
+	return nil
 }
 
 // SetHealthCheck validates and applies the health check period and path.
@@ -70,6 +86,8 @@ func NewConfig(listen, backends string) (*Config, error) {
 		Backends:       urls,
 		HealthInterval: DefaultHealthInterval,
 		HealthPath:     DefaultHealthPath,
+		// Keep-alive is on by default, like most real load balancers.
+		KeepAliveTimeout: DefaultKeepAliveTimeout,
 	}, nil
 }
 

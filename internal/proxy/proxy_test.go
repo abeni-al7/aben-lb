@@ -24,6 +24,8 @@ func startProxy(t *testing.T, backend string) *Server {
 	if err != nil {
 		t.Fatalf("build proxy config: %v", err)
 	}
+	// These tests cover the one-request-per-connection (no keep-alive) mode.
+	cfg.KeepAliveTimeout = 0
 	srv := NewServer(cfg, io.Discard)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start proxy: %v", err)
@@ -1176,6 +1178,8 @@ func TestGoroutineCleanupAfterMixedLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build proxy config: %v", err)
 	}
+	// These tests cover the one-request-per-connection (no keep-alive) mode.
+	cfg.KeepAliveTimeout = 0
 	srv := NewServer(cfg, io.Discard)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start proxy: %v", err)

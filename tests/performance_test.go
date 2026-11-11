@@ -216,7 +216,7 @@ func startPerfProcesses(tb testing.TB) (lbURL, beURL string, stop func()) {
 	be.waitForOutput(beAddr, 5*time.Second)
 
 	lbAddr := freeLoopbackAddr(tb)
-	lb := startProcess(tb, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr)
+	lb := startProcess(tb, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr, "-keepalive-timeout", "0")
 	lb.waitForOutput(lbAddr, 5*time.Second)
 
 	return "http://" + lbAddr, "http://" + beAddr, func() {

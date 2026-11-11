@@ -79,15 +79,28 @@ func (s *Server) Start() error {
 		// Stable activity records replace the standard server's raw
 		// network error text, which must never reach diagnostics.
 		ErrorLog: log.New(io.Discard, "", 0),
+		// When a kept-alive connection goes idle between requests, re-arm
+		// its validation so the next request is checked like the first.
+		ConnState: func(c net.Conn, state http.ConnState) {
+			if vc, ok := c.(*validatingConn); ok && state == http.StateIdle {
+				vc.nextRequest()
+			}
+		},
 	}
-	// One request and one response per client connection.
-	s.httpServer.SetKeepAlivesEnabled(false)
+	if s.cfg.KeepAliveTimeout > 0 {
+		// Keep-alive: a client can send further requests on the same
+		// connection; it is closed after this long without one.
+		s.httpServer.IdleTimeout = s.cfg.KeepAliveTimeout
+	} else {
+		// One request and one response per client connection.
+		s.httpServer.SetKeepAlivesEnabled(false)
+	}
 	backends := make([]string, len(s.cfg.Backends))
 	for i, b := range s.cfg.Backends {
 		backends[i] = b.String()
 	}
-	s.logf("event=startup role=load-balancer listen=%s backends=%s health_interval=%s health_path=%s",
-		ln.Addr(), strings.Join(backends, ","), s.cfg.HealthInterval, s.cfg.HealthPath)
+	s.logf("event=startup role=load-balancer listen=%s backends=%s health_interval=%s health_path=%s keepalive_timeout=%s",
+		ln.Addr(), strings.Join(backends, ","), s.cfg.HealthInterval, s.cfg.HealthPath, s.cfg.KeepAliveTimeout)
 	s.startHealthChecks()
 	go func() {
 		err := s.httpServer.Serve(&validatingListener{Listener: ln, srv: s})
@@ -111,6 +124,28 @@ func requestIDFrom(ctx context.Context) string {
 // backendKey carries the backend chosen for a request from the handler to
 // the reverse proxy's Rewrite step.
 type backendKey struct{}
+
+// forwardStartKey carries the time a request was handed to the reverse
+// proxy, so outcome records can say how long the backend took.
+type forwardStartKey struct{}
+
+// backendDuration formats the time since the request was forwarded as
+// fractional milliseconds, e.g. "1.234".
+func backendDuration(ctx context.Context) string {
+	start, ok := ctx.Value(forwardStartKey{}).(time.Time)
+	if !ok {
+		return "0"
+	}
+	return strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 3, 64)
+}
+
+// backendHost returns the host:port of the backend chosen for a request.
+func backendHost(ctx context.Context) string {
+	if u, ok := ctx.Value(backendKey{}).(*url.URL); ok {
+		return u.Host
+	}
+	return ""
+}
 
 // handler assigns each accepted request a unique ID, writes its redacted
 // activity record, and forwards it through the reverse proxy.
@@ -136,8 +171,9 @@ func (s *Server) handler() http.Handler {
 			writeGeneratedError(w, http.StatusServiceUnavailable)
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), backendKey{}, backend))
-		rp.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), backendKey{}, backend)
+		ctx = context.WithValue(ctx, forwardStartKey{}, time.Now())
+		rp.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -173,9 +209,13 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 		},
 		Transport: transport,
 		// Every relayed backend status is recorded with the request ID so
-		// interleaved concurrent outcomes stay unambiguous (FR-013).
+		// interleaved concurrent outcomes stay unambiguous (FR-013), plus
+		// which backend answered and how long it took to send its response
+		// headers.
 		ModifyResponse: func(resp *http.Response) error {
-			s.logf("event=response id=%s backend=%s status=%d", requestIDFrom(resp.Request.Context()), resp.Request.URL.Host, resp.StatusCode)
+			ctx := resp.Request.Context()
+			s.logf("event=response id=%s backend=%s status=%d duration_ms=%s",
+				requestIDFrom(ctx), backendHost(ctx), resp.StatusCode, backendDuration(ctx))
 			return nil
 		},
 		// Forwarding failures stay isolated to their own request: a client
@@ -183,13 +223,14 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 		// a classified generated error while unrelated connections continue
 		// untouched (FR-014, FR-015, FR-026, FR-028).
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			id := requestIDFrom(r.Context())
-			if r.Context().Err() != nil {
-				s.logf("event=error id=%s class=client_disconnect", id)
+			ctx := r.Context()
+			id := requestIDFrom(ctx)
+			if ctx.Err() != nil {
+				s.logf("event=error id=%s class=client_disconnect backend=%s duration_ms=%s", id, backendHost(ctx), backendDuration(ctx))
 				return
 			}
 			class, status := classifyForwardingError(err)
-			s.logf("event=error id=%s class=%s status=%d", id, class, status)
+			s.logf("event=error id=%s class=%s status=%d backend=%s duration_ms=%s", id, class, status, backendHost(ctx), backendDuration(ctx))
 			writeGeneratedError(w, status)
 		},
 	}
@@ -272,17 +313,32 @@ func (l *validatingListener) Accept() (net.Conn, error) {
 	return &validatingConn{Conn: conn, srv: l.srv}, nil
 }
 
-// validatingConn pre-reads one request's header block on the first server
-// read. Valid header blocks are replayed to the standard parser unchanged;
-// malformed or incomplete syntax is answered with the exact 400 while a
-// pre-request disconnect is only logged, and both make the connection look
-// cleanly closed to the server (FR-019, FR-026).
+// validatingConn pre-reads each request's header block on the first server
+// read for that request. Valid header blocks are replayed to the standard
+// parser unchanged; malformed or incomplete syntax is answered with the
+// exact 400 while a pre-request disconnect is only logged, and both make the
+// connection look cleanly closed to the server (FR-019, FR-026).
 type validatingConn struct {
 	net.Conn
 	srv      *Server
 	checked  bool
 	rejected bool
 	pending  []byte
+	// reused is set once the connection has served a request and is kept
+	// alive waiting for another.
+	reused bool
+}
+
+// nextRequest re-arms validation after a request on a kept-alive connection
+// finished. The server calls it (via ConnState) from the connection's own
+// goroutine before reading the next request, so no Read runs concurrently.
+// Bytes still pending were sent before the previous response (pipelining,
+// which is unsupported) and are left to the standard parser.
+func (c *validatingConn) nextRequest() {
+	c.reused = true
+	if len(c.pending) == 0 {
+		c.checked = false
+	}
 }
 
 func (c *validatingConn) Read(p []byte) (int, error) {
@@ -322,6 +378,12 @@ func (c *validatingConn) validate() {
 		n, err := c.Conn.Read(tmp)
 		buf = append(buf, tmp[:n]...)
 		if err != nil {
+			if len(buf) == 0 && c.reused {
+				// A kept-alive client closed the connection, or the idle
+				// timeout expired, between requests: a normal end.
+				c.rejected = true
+				return
+			}
 			if len(buf) == 0 || err != io.EOF {
 				// The client vanished before a request could be parsed.
 				c.srv.logf("event=error class=client_disconnect client=%s", c.RemoteAddr())

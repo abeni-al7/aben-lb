@@ -21,7 +21,7 @@ func TestForwardSingleRequestEndToEnd(t *testing.T) {
 	be.waitForOutput(beAddr, 5*time.Second)
 
 	lbAddr := freeLoopbackAddr(t)
-	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr)
+	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr, "-keepalive-timeout", "0")
 	lb.waitForOutput(lbAddr, 5*time.Second)
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -144,7 +144,7 @@ func TestMalformedRequestsEndToEnd(t *testing.T) {
 	be.waitForOutput(beAddr, 5*time.Second)
 
 	lbAddr := freeLoopbackAddr(t)
-	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr)
+	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr, "-keepalive-timeout", "0")
 	lb.waitForOutput(lbAddr, 5*time.Second)
 
 	t.Run("malformed request line", func(t *testing.T) {
@@ -228,7 +228,7 @@ func TestCrossStoryRegressionsEndToEnd(t *testing.T) {
 	be.waitForOutput(beAddr, 5*time.Second)
 
 	lbAddr := freeLoopbackAddr(t)
-	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr)
+	lb := startProcess(t, "lb", "-listen", lbAddr, "-backend", "http://"+beAddr, "-keepalive-timeout", "0")
 	lb.waitForOutput(lbAddr, 5*time.Second)
 
 	// Secret-bearing success request through the running binaries.
@@ -254,7 +254,7 @@ func TestCrossStoryRegressionsEndToEnd(t *testing.T) {
 	// A proxy with a down backend generates a 502 without disclosure.
 	downAddr := freeLoopbackAddr(t)
 	lbDownAddr := freeLoopbackAddr(t)
-	lbDown := startProcess(t, "lb", "-listen", lbDownAddr, "-backend", "http://"+downAddr)
+	lbDown := startProcess(t, "lb", "-listen", lbDownAddr, "-backend", "http://"+downAddr, "-keepalive-timeout", "0")
 	lbDown.waitForOutput(lbDownAddr, 5*time.Second)
 	raw = rawExchange(t, lbDownAddr, "GET / HTTP/1.1\r\nHost: down.test\r\n\r\n", false)
 	if !strings.HasPrefix(raw, "HTTP/1.1 502 Bad Gateway") {
