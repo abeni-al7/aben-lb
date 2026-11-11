@@ -1227,3 +1227,32 @@ func TestGoroutineCleanupAfterMixedLoad(t *testing.T) {
 			before, after, buf[:runtime.Stack(buf, true)])
 	}
 }
+
+// TestRoundRobin checks the challenge's example: with three backends and six
+// requests, backend A gets 1 and 4, B gets 2 and 5, C gets 3 and 6.
+func TestRoundRobin(t *testing.T) {
+	var urls []string
+	for _, name := range []string{"A", "B", "C"} {
+		name := name
+		be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, name)
+		}))
+		t.Cleanup(be.Close)
+		urls = append(urls, be.URL)
+	}
+	srv := startProxy(t, strings.Join(urls, ","))
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		resp, err := http.Get("http://" + srv.Addr() + "/")
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		got = append(got, string(body))
+	}
+	if want := "A B C A B C"; strings.Join(got, " ") != want {
+		t.Fatalf("backends in order = %q, want %q", strings.Join(got, " "), want)
+	}
+}

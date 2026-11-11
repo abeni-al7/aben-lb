@@ -22,7 +22,7 @@ func main() {
 
 func run() int {
 	listen := flag.String("listen", "", "TCP address (host:port) accepting client HTTP connections")
-	backend := flag.String("backend", "", "absolute cleartext HTTP origin (http://host:port) receiving every request")
+	backend := flag.String("backend", "", "comma-separated cleartext HTTP origins (http://host:port,...) that requests are spread across in round-robin order")
 	flag.Parse()
 
 	cfg, err := proxy.NewConfig(*listen, *backend)
