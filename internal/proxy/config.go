@@ -7,6 +7,13 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"time"
+)
+
+// Default health check settings, used unless SetHealthCheck overrides them.
+const (
+	DefaultHealthInterval = 10 * time.Second
+	DefaultHealthPath     = "/"
 )
 
 // Config is the immutable, validated startup configuration for the proxy.
@@ -16,6 +23,27 @@ type Config struct {
 	// Backends are the cleartext HTTP origins that requests are spread
 	// across in round-robin order. There is always at least one.
 	Backends []*url.URL
+	// HealthInterval is how often every backend is health checked.
+	HealthInterval time.Duration
+	// HealthPath is the path requested with GET on each backend; only a
+	// 200 response counts as healthy.
+	HealthPath string
+}
+
+// SetHealthCheck validates and applies the health check period and path.
+func (c *Config) SetHealthCheck(interval time.Duration, path string) error {
+	if interval <= 0 {
+		return fmt.Errorf("health check interval must be positive, got %v", interval)
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("health check path %q must start with /", path)
+	}
+	if _, err := url.ParseRequestURI(path); err != nil {
+		return fmt.Errorf("health check path %q is not valid: %v", path, err)
+	}
+	c.HealthInterval = interval
+	c.HealthPath = path
+	return nil
 }
 
 // NewConfig validates the listen address and backend targets before any
@@ -30,14 +58,19 @@ func NewConfig(listen, backends string) (*Config, error) {
 		return nil, fmt.Errorf("backend URL is required")
 	}
 	var urls []*url.URL
-	for _, b := range strings.Split(backends, ",") {
+	for b := range strings.SplitSeq(backends, ",") {
 		u, err := validateBackendURL(strings.TrimSpace(b))
 		if err != nil {
 			return nil, err
 		}
 		urls = append(urls, u)
 	}
-	return &Config{ListenAddr: listen, Backends: urls}, nil
+	return &Config{
+		ListenAddr:     listen,
+		Backends:       urls,
+		HealthInterval: DefaultHealthInterval,
+		HealthPath:     DefaultHealthPath,
+	}, nil
 }
 
 func validateListenAddr(listen string) error {

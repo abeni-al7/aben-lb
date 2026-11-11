@@ -16,41 +16,71 @@ Requires Go 1.25 or newer.
 
 ```text
 lb -listen <host:port> -backend <http://host:port>[,<http://host:port>...]
+   [-health-interval <duration>] [-health-path </path>]
 ```
 
 | Flag | Required | Meaning |
 |------|----------|---------|
 | `-listen` | Yes | TCP address on which client HTTP connections are accepted |
 | `-backend` | Yes | Comma-separated list of absolute cleartext HTTP origins |
+| `-health-interval` | No | How often each backend is health checked, e.g. `10s`, `500ms` (default `10s`) |
+| `-health-path` | No | Path requested with `GET` on each backend for the health check (default `/`) |
 
-Requests are distributed with **round robin**: each new request goes to the next backend in the
-list, wrapping back to the first after the last. With backends A, B, C and six requests, A gets
-requests 1 and 4, B gets 2 and 5, C gets 3 and 6. Every request counts, including a browser's
-automatic `/favicon.ico` fetch. Each `event=response` record names the backend that served it.
+Requests are distributed with **round robin** over the **healthy** backends: each new request
+goes to the next healthy backend in the list, wrapping back to the first after the last. With
+backends A, B, C and six requests, A gets requests 1 and 4, B gets 2 and 5, C gets 3 and 6. Every
+request counts, including a browser's automatic `/favicon.ico` fetch. Each `event=response`
+record names the backend that served it.
+
+#### Health checks
+
+A background task sends `GET <backend><health-path>` to every backend once per interval, all
+backends at the same time. A `200` response means healthy; any other status, a redirect, a
+refused connection, or no answer within 5 seconds (or the interval, if shorter) means unhealthy.
+
+- An unhealthy backend is taken out of the rotation; when its check passes again it is added
+  back. Each change is logged once, e.g. `event=health backend=localhost:8082 state=down`.
+- Backends start out healthy and the first check runs one interval after startup, so a backend
+  that dies is noticed within one interval. Requests sent to it during that window get a `502`.
+- When no backend is healthy, `lb` answers `503 Service Unavailable` without contacting any.
 
 Each backend value accepts an `http` scheme and authority only; one invalid entry rejects the
 whole list. Credentials, non-root paths,
 queries, fragments, and `https` targets are rejected before the listener opens. On invalid
 configuration the process prints a concise diagnostic and exits with status `2`; on bind or
-serving failure it exits with status `1`. Backend reachability is checked per request, not at
-startup.
+serving failure it exits with status `1`. Backend reachability is not checked at startup; see
+Health checks above.
 
 On success `lb` writes a startup record to standard output identifying the listening address and
 backend targets, then serves until interrupted.
 
-#### Trying it with two Python servers
+#### Trying it with three Python servers
 
-`server8080/` and `server8081/` hold a small page that names its port:
+`server8080/`, `server8081/`, and `server8082/` each hold a small page that names its port:
 
 ```sh
 python3 -m http.server 8080 --directory server8080 &
 python3 -m http.server 8081 --directory server8081 &
-go run ./cmd/lb -listen localhost:8000 -backend http://localhost:8080,http://localhost:8081
-for i in 1 2 3 4; do curl -s http://localhost:8000/ | grep Hello; done
+python3 -m http.server 8082 --directory server8082 &
+go run ./cmd/lb -listen localhost:8000 -health-interval 10s \
+  -backend http://localhost:8080,http://localhost:8081,http://localhost:8082
+for i in 1 2 3 4 5 6; do curl -s http://localhost:8000/ | grep Hello; done
 ```
 
-The responses alternate between port 8080 and 8081. In a browser, caching (`304 Not Modified`
-replies) can hide the alternation; add a changing query such as `?visit=1`, `?visit=2`.
+The responses rotate through ports 8080, 8081, and 8082. Stop the 8082 server
+(`kill $(lsof -t -i :8082 -sTCP:LISTEN)`); within 10 seconds `lb` logs `state=down` and
+requests go only to 8080 and 8081. Start it again and within 10 seconds it rejoins.
+
+To send concurrent requests, put the same line in a file several times and let curl run them in
+parallel:
+
+```sh
+for i in $(seq 8); do echo 'url = "http://localhost:8000"'; done > urls.txt
+curl --parallel --parallel-immediate --parallel-max 3 --config urls.txt
+```
+
+In a browser, caching (`304 Not Modified` replies) can hide the rotation; add a changing query
+such as `?visit=1`, `?visit=2`.
 
 ### `be` — test backend
 
@@ -95,9 +125,8 @@ status `0`. Requests still running when the drain window ends are terminated.
 
 Persistent client connections, pipelining, protocol upgrades, CONNECT tunneling, TLS termination,
 encrypted pass-through, obsolete folded headers, conflicting framing headers, and long-lived
-streaming are unsupported. Algorithms other than round robin, health checks, failover, retries,
-and route-based selection are not implemented yet: a down backend still receives its turn and
-that request gets a `502`.
+streaming are unsupported. Algorithms other than round robin, retries, and route-based selection
+are not implemented: a failed request is never re-sent to another backend.
 
 ## Diagnostics, request IDs, and privacy
 
@@ -116,9 +145,10 @@ Privacy rules for the request record:
 Example:
 
 ```text
-event=startup role=load-balancer listen=127.0.0.1:18080 backend=http://127.0.0.1:18081
+event=startup role=load-balancer listen=127.0.0.1:18080 backends=http://127.0.0.1:18081 health_interval=10s health_path=/
 event=request id=9f86d081e2a4c3b1 client=127.0.0.1:53712 method=GET target=/[REDACTED]?[REDACTED] headers="Accept: text/plain; Authorization: [REDACTED]; Host: 127.0.0.1:18080; User-Agent: curl/8.5.0"
-event=response id=9f86d081e2a4c3b1 status=200
+event=response id=9f86d081e2a4c3b1 backend=127.0.0.1:18081 status=200
+event=health backend=127.0.0.1:18081 state=down
 event=shutdown role=load-balancer listen=127.0.0.1:18080
 ```
 
@@ -134,6 +164,7 @@ raw network errors, backend addresses, or internal details are ever exposed to c
 | Backend refused, unreachable, or not connected within 5 seconds | `502 Bad Gateway` | `Bad Gateway\n` | `backend_connection` |
 | Backend closed early, sent a malformed response, or another non-timeout forwarding failure | `502 Bad Gateway` | `Bad Gateway\n` | `backend_response` |
 | Connected backend sent no response headers for 5 seconds after the full request | `504 Gateway Timeout` | `Gateway Timeout\n` | `backend_timeout` |
+| Every backend is failing its health check | `503 Service Unavailable` | `Service Unavailable\n` | `no_healthy_backend` |
 
 Standard protocol-limit responses (such as `431 Request Header Fields Too Large`) are preserved,
 not reclassified as `400`. A client that disconnects before completing its request receives no

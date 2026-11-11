@@ -23,9 +23,14 @@ func main() {
 func run() int {
 	listen := flag.String("listen", "", "TCP address (host:port) accepting client HTTP connections")
 	backend := flag.String("backend", "", "comma-separated cleartext HTTP origins (http://host:port,...) that requests are spread across in round-robin order")
+	healthInterval := flag.Duration("health-interval", proxy.DefaultHealthInterval, "how often each backend is health checked (e.g. 10s, 500ms)")
+	healthPath := flag.String("health-path", proxy.DefaultHealthPath, "path requested with GET on each backend; only a 200 response is healthy")
 	flag.Parse()
 
 	cfg, err := proxy.NewConfig(*listen, *backend)
+	if err == nil {
+		err = cfg.SetHealthCheck(*healthInterval, *healthPath)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lb: invalid configuration: %v\n", err)
 		return 2

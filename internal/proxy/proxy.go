@@ -28,6 +28,8 @@ const (
 	badRequestBody     = "Bad Request\n"
 	badGatewayBody     = "Bad Gateway\n"
 	gatewayTimeoutBody = "Gateway Timeout\n"
+	// Sent when every backend is failing its health check.
+	serviceUnavailableBody = "Service Unavailable\n"
 )
 
 // Server is the single-backend HTTP/1.1 reverse proxy. Each accepted client
@@ -46,20 +48,23 @@ type Server struct {
 	// next counts requests handed out so far; it drives round-robin
 	// selection and is shared safely by concurrent requests.
 	next atomic.Uint64
-}
 
-// nextBackend picks the backend for a new request using round robin: each
-// request goes to the next backend in the list, wrapping back to the first
-// after the last.
-func (s *Server) nextBackend() *url.URL {
-	n := s.next.Add(1) - 1
-	return s.cfg.Backends[n%uint64(len(s.cfg.Backends))]
+	// healthy[i] is the latest health check result for cfg.Backends[i].
+	// The background checker writes it while requests read it.
+	healthy    []atomic.Bool
+	stopHealth context.CancelFunc
+	healthDone chan struct{}
 }
 
 // NewServer builds an unstarted proxy for cfg that writes activity records
-// to out.
+// to out. Every backend starts out healthy.
 func NewServer(cfg *Config, out io.Writer) *Server {
-	return &Server{cfg: cfg, out: out, done: make(chan error, 1)}
+	s := &Server{cfg: cfg, out: out, done: make(chan error, 1)}
+	s.healthy = make([]atomic.Bool, len(cfg.Backends))
+	for i := range s.healthy {
+		s.healthy[i].Store(true)
+	}
+	return s
 }
 
 // Start opens the listener, records startup, and serves in the background.
@@ -81,7 +86,9 @@ func (s *Server) Start() error {
 	for i, b := range s.cfg.Backends {
 		backends[i] = b.String()
 	}
-	s.logf("event=startup role=load-balancer listen=%s backends=%s", ln.Addr(), strings.Join(backends, ","))
+	s.logf("event=startup role=load-balancer listen=%s backends=%s health_interval=%s health_path=%s",
+		ln.Addr(), strings.Join(backends, ","), s.cfg.HealthInterval, s.cfg.HealthPath)
+	s.startHealthChecks()
 	go func() {
 		err := s.httpServer.Serve(&validatingListener{Listener: ln, srv: s})
 		if err == http.ErrServerClosed {
@@ -101,6 +108,10 @@ func requestIDFrom(ctx context.Context) string {
 	return id
 }
 
+// backendKey carries the backend chosen for a request from the handler to
+// the reverse proxy's Rewrite step.
+type backendKey struct{}
+
 // handler assigns each accepted request a unique ID, writes its redacted
 // activity record, and forwards it through the reverse proxy.
 func (s *Server) handler() http.Handler {
@@ -119,6 +130,13 @@ func (s *Server) handler() http.Handler {
 				panic(p)
 			}
 		}()
+		backend, ok := s.nextBackend()
+		if !ok {
+			s.logf("event=error id=%s class=no_healthy_backend status=%d", id, http.StatusServiceUnavailable)
+			writeGeneratedError(w, http.StatusServiceUnavailable)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), backendKey{}, backend))
 		rp.ServeHTTP(w, r)
 	})
 }
@@ -139,7 +157,7 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 	s.transport = transport
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			backend := s.nextBackend()
+			backend := pr.In.Context().Value(backendKey{}).(*url.URL)
 			pr.Out.URL.Scheme = backend.Scheme
 			pr.Out.URL.Host = backend.Host
 			// Preserve the client-supplied authority instead of the backend's.
@@ -198,8 +216,11 @@ func classifyForwardingError(err error) (string, int) {
 // response without disclosing internal failure details (FR-028).
 func writeGeneratedError(w http.ResponseWriter, status int) {
 	body := badGatewayBody
-	if status == http.StatusGatewayTimeout {
+	switch status {
+	case http.StatusGatewayTimeout:
 		body = gatewayTimeoutBody
+	case http.StatusServiceUnavailable:
+		body = serviceUnavailableBody
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -220,6 +241,7 @@ func (s *Server) Done() <-chan error {
 // Shutdown stops accepting connections, drains active requests until ctx
 // expires, releases pooled backend connections, and records shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopHealthChecks()
 	err := s.httpServer.Shutdown(ctx)
 	if s.transport != nil {
 		s.transport.CloseIdleConnections()
