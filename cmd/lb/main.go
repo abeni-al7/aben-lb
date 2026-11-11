@@ -25,11 +25,15 @@ func run() int {
 	backend := flag.String("backend", "", "comma-separated cleartext HTTP origins (http://host:port,...) that requests are spread across in round-robin order")
 	healthInterval := flag.Duration("health-interval", proxy.DefaultHealthInterval, "how often each backend is health checked (e.g. 10s, 500ms)")
 	healthPath := flag.String("health-path", proxy.DefaultHealthPath, "path requested with GET on each backend; only a 200 response is healthy")
+	keepAlive := flag.Duration("keepalive-timeout", proxy.DefaultKeepAliveTimeout, "how long an idle client connection stays open for another request; 0 closes every connection after one request")
 	flag.Parse()
 
 	cfg, err := proxy.NewConfig(*listen, *backend)
 	if err == nil {
 		err = cfg.SetHealthCheck(*healthInterval, *healthPath)
+	}
+	if err == nil {
+		err = cfg.SetKeepAliveTimeout(*keepAlive)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lb: invalid configuration: %v\n", err)

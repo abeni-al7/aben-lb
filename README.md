@@ -16,7 +16,7 @@ Requires Go 1.25 or newer.
 
 ```text
 lb -listen <host:port> -backend <http://host:port>[,<http://host:port>...]
-   [-health-interval <duration>] [-health-path </path>]
+   [-health-interval <duration>] [-health-path </path>] [-keepalive-timeout <duration>]
 ```
 
 | Flag | Required | Meaning |
@@ -25,6 +25,7 @@ lb -listen <host:port> -backend <http://host:port>[,<http://host:port>...]
 | `-backend` | Yes | Comma-separated list of absolute cleartext HTTP origins |
 | `-health-interval` | No | How often each backend is health checked, e.g. `10s`, `500ms` (default `10s`) |
 | `-health-path` | No | Path requested with `GET` on each backend for the health check (default `/`) |
+| `-keepalive-timeout` | No | How long an idle client connection stays open for another request (default `30s`); `0` closes every connection after one request |
 
 Requests are distributed with **round robin** over the **healthy** backends: each new request
 goes to the next healthy backend in the list, wrapping back to the first after the last. With
@@ -107,8 +108,13 @@ status `0`. Requests still running when the drain window ends are terminated.
 ### Supported
 
 - Cleartext HTTP/1.1 on the client side and toward every backend origin.
-- Exactly one request and one response per client connection; the connection then closes and the
-  response advertises `Connection: close`.
+- **Keep-alive** (default): a client can send further requests on the same connection, one at a
+  time; it is closed after `-keepalive-timeout` with no new request, or after a request that sends
+  `Connection: close`. Round robin still applies per request, so successive requests on one
+  connection go to different backends. Every request on a connection is validated, not just the
+  first. Connections from `lb` to the backends are pooled and reused the same way.
+- With `-keepalive-timeout 0`: exactly one request and one response per client connection; the
+  connection then closes and the response advertises `Connection: close`.
 - Any valid method token, origin-form target, and a body framed by `Content-Length`, valid
   chunked transfer coding, or no body.
 - Forwarding preserves the method, raw path and query, original `Host` value, end-to-end header
@@ -123,7 +129,7 @@ status `0`. Requests still running when the drain window ends are terminated.
 
 ### Excluded
 
-Persistent client connections, pipelining, protocol upgrades, CONNECT tunneling, TLS termination,
+Pipelining (sending a request before the previous response arrives), protocol upgrades, CONNECT tunneling, TLS termination,
 encrypted pass-through, obsolete folded headers, conflicting framing headers, and long-lived
 streaming are unsupported. Algorithms other than round robin, retries, and route-based selection
 are not implemented: a failed request is never re-sent to another backend.
@@ -133,6 +139,10 @@ are not implemented: a failed request is never re-sent to another backend.
 `lb` writes line-oriented `event=... key=value` records to standard output. Every accepted request
 gets a unique request ID; the accepted-request record and its outcome record (backend status or
 failure class) carry the same `id=` value, so an operator can correlate a request with its result.
+
+Each outcome record also says which backend handled the request (`backend=host:port`) and how
+long it took (`duration_ms=`): the time from forwarding the request until the backend's response
+headers arrived, or until forwarding failed.
 
 Privacy rules for the request record:
 
@@ -145,9 +155,9 @@ Privacy rules for the request record:
 Example:
 
 ```text
-event=startup role=load-balancer listen=127.0.0.1:18080 backends=http://127.0.0.1:18081 health_interval=10s health_path=/
+event=startup role=load-balancer listen=127.0.0.1:18080 backends=http://127.0.0.1:18081 health_interval=10s health_path=/ keepalive_timeout=30s
 event=request id=9f86d081e2a4c3b1 client=127.0.0.1:53712 method=GET target=/[REDACTED]?[REDACTED] headers="Accept: text/plain; Authorization: [REDACTED]; Host: 127.0.0.1:18080; User-Agent: curl/8.5.0"
-event=response id=9f86d081e2a4c3b1 backend=127.0.0.1:18081 status=200
+event=response id=9f86d081e2a4c3b1 backend=127.0.0.1:18081 status=200 duration_ms=1.549
 event=health backend=127.0.0.1:18081 state=down
 event=shutdown role=load-balancer listen=127.0.0.1:18080
 ```
@@ -233,7 +243,8 @@ Hello From Backend Server
 ```
 
 `be` logs the request and response confirmation, `lb` logs the accepted request and the `200`
-outcome under the same request ID, and the client connection closes after the one response. Stop
+outcome under the same request ID with the backend and `duration_ms`. curl closes its connection
+after the one request; give it several URLs to see it reuse one connection. Stop
 both processes with `Ctrl+C`; each drains for at most five seconds, records shutdown, and exits
 cleanly.
 
@@ -246,3 +257,10 @@ go test ./...
 go test -race ./...
 go test ./tests -run TestPerformanceBudget -count=1
 ```
+
+`TestMultipleBackendsEndToEnd` starts three `be` processes, an `lb`, and 20 concurrent
+keep-alive clients. It checks that 300 requests are split exactly 100 per backend, that clients
+reuse their connections, that every response record carries `duration_ms`, and that after one
+backend is killed the next 60 requests all succeed, split 30/30 across the other two. The older
+single-backend tests run `lb` with `-keepalive-timeout 0` because they check the
+one-request-per-connection contract.
