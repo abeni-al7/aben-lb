@@ -1,10 +1,10 @@
 # aben-lb
 
-A single-backend HTTP/1.1 reverse proxy written in Go with only the standard library. The
-repository ships two commands:
+An HTTP/1.1 load balancer written in Go with only the standard library. The repository ships two
+commands:
 
-- `lb` — the load balancer: accepts client HTTP/1.1 connections and forwards every request to one
-  configured backend origin.
+- `lb` — the load balancer: accepts client HTTP/1.1 connections and spreads requests across one
+  or more configured backend origins using round robin.
 - `be` — a deterministic test backend used for development, automated testing, and the end-to-end
   example below.
 
@@ -15,22 +15,42 @@ Requires Go 1.25 or newer.
 ### `lb` — load balancer
 
 ```text
-lb -listen <host:port> -backend <http://host:port>
+lb -listen <host:port> -backend <http://host:port>[,<http://host:port>...]
 ```
 
 | Flag | Required | Meaning |
 |------|----------|---------|
 | `-listen` | Yes | TCP address on which client HTTP connections are accepted |
-| `-backend` | Yes | Absolute cleartext HTTP origin receiving every request |
+| `-backend` | Yes | Comma-separated list of absolute cleartext HTTP origins |
 
-The backend value accepts an `http` scheme and authority only. Credentials, non-root paths,
+Requests are distributed with **round robin**: each new request goes to the next backend in the
+list, wrapping back to the first after the last. With backends A, B, C and six requests, A gets
+requests 1 and 4, B gets 2 and 5, C gets 3 and 6. Every request counts, including a browser's
+automatic `/favicon.ico` fetch. Each `event=response` record names the backend that served it.
+
+Each backend value accepts an `http` scheme and authority only; one invalid entry rejects the
+whole list. Credentials, non-root paths,
 queries, fragments, and `https` targets are rejected before the listener opens. On invalid
 configuration the process prints a concise diagnostic and exits with status `2`; on bind or
 serving failure it exits with status `1`. Backend reachability is checked per request, not at
 startup.
 
 On success `lb` writes a startup record to standard output identifying the listening address and
-backend target, then serves until interrupted.
+backend targets, then serves until interrupted.
+
+#### Trying it with two Python servers
+
+`server8080/` and `server8081/` hold a small page that names its port:
+
+```sh
+python3 -m http.server 8080 --directory server8080 &
+python3 -m http.server 8081 --directory server8081 &
+go run ./cmd/lb -listen localhost:8000 -backend http://localhost:8080,http://localhost:8081
+for i in 1 2 3 4; do curl -s http://localhost:8000/ | grep Hello; done
+```
+
+The responses alternate between port 8080 and 8081. In a browser, caching (`304 Not Modified`
+replies) can hide the alternation; add a changing query such as `?visit=1`, `?visit=2`.
 
 ### `be` — test backend
 
@@ -56,7 +76,7 @@ status `0`. Requests still running when the drain window ends are terminated.
 
 ### Supported
 
-- Cleartext HTTP/1.1 on the client side and toward the single backend origin.
+- Cleartext HTTP/1.1 on the client side and toward every backend origin.
 - Exactly one request and one response per client connection; the connection then closes and the
   response advertises `Connection: close`.
 - Any valid method token, origin-form target, and a body framed by `Content-Length`, valid
@@ -75,8 +95,9 @@ status `0`. Requests still running when the drain window ends are terminated.
 
 Persistent client connections, pipelining, protocol upgrades, CONNECT tunneling, TLS termination,
 encrypted pass-through, obsolete folded headers, conflicting framing headers, and long-lived
-streaming are unsupported. Backend pools, balancing algorithms, health checks, failover, retries,
-and route-based selection are out of scope: one backend target serves all requests.
+streaming are unsupported. Algorithms other than round robin, health checks, failover, retries,
+and route-based selection are not implemented yet: a down backend still receives its turn and
+that request gets a `502`.
 
 ## Diagnostics, request IDs, and privacy
 

@@ -67,12 +67,35 @@ func TestNewConfigBackendValidation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewConfig(_, %q) failed: %v", tt.backend, err)
 			}
-			if got := cfg.BackendURL.String(); got != "http://127.0.0.1:9000" {
-				t.Fatalf("BackendURL = %q, want normalized %q", got, "http://127.0.0.1:9000")
+			if got := cfg.Backends[0].String(); got != "http://127.0.0.1:9000" {
+				t.Fatalf("Backends[0] = %q, want normalized %q", got, "http://127.0.0.1:9000")
 			}
-			if cfg.BackendURL.Path != "" || cfg.BackendURL.RawQuery != "" || cfg.BackendURL.Fragment != "" || cfg.BackendURL.User != nil {
-				t.Fatalf("BackendURL %#v retains non-origin components", cfg.BackendURL)
+			if cfg.Backends[0].Path != "" || cfg.Backends[0].RawQuery != "" || cfg.Backends[0].Fragment != "" || cfg.Backends[0].User != nil {
+				t.Fatalf("Backends[0] %#v retains non-origin components", cfg.Backends[0])
 			}
 		})
+	}
+}
+
+func TestNewConfigMultipleBackends(t *testing.T) {
+	cfg, err := NewConfig("127.0.0.1:0", "http://127.0.0.1:8080, http://127.0.0.1:8081/")
+	if err != nil {
+		t.Fatalf("NewConfig with two backends failed: %v", err)
+	}
+	want := []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081"}
+	if len(cfg.Backends) != len(want) {
+		t.Fatalf("got %d backends, want %d", len(cfg.Backends), len(want))
+	}
+	for i, w := range want {
+		if got := cfg.Backends[i].String(); got != w {
+			t.Fatalf("Backends[%d] = %q, want %q", i, got, w)
+		}
+	}
+
+	// One bad entry rejects the whole list, including an empty entry.
+	for _, bad := range []string{"http://127.0.0.1:8080,https://127.0.0.1:8081", "http://127.0.0.1:8080,"} {
+		if _, err := NewConfig("127.0.0.1:0", bad); err == nil {
+			t.Fatalf("NewConfig(_, %q) succeeded; want validation error", bad)
+		}
 	}
 }

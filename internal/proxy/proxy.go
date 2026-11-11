@@ -11,8 +11,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +42,18 @@ type Server struct {
 	listener   net.Listener
 	transport  *http.Transport
 	done       chan error
+
+	// next counts requests handed out so far; it drives round-robin
+	// selection and is shared safely by concurrent requests.
+	next atomic.Uint64
+}
+
+// nextBackend picks the backend for a new request using round robin: each
+// request goes to the next backend in the list, wrapping back to the first
+// after the last.
+func (s *Server) nextBackend() *url.URL {
+	n := s.next.Add(1) - 1
+	return s.cfg.Backends[n%uint64(len(s.cfg.Backends))]
 }
 
 // NewServer builds an unstarted proxy for cfg that writes activity records
@@ -62,7 +77,11 @@ func (s *Server) Start() error {
 	}
 	// One request and one response per client connection.
 	s.httpServer.SetKeepAlivesEnabled(false)
-	s.logf("event=startup role=load-balancer listen=%s backend=%s", ln.Addr(), s.cfg.BackendURL)
+	backends := make([]string, len(s.cfg.Backends))
+	for i, b := range s.cfg.Backends {
+		backends[i] = b.String()
+	}
+	s.logf("event=startup role=load-balancer listen=%s backends=%s", ln.Addr(), strings.Join(backends, ","))
 	go func() {
 		err := s.httpServer.Serve(&validatingListener{Listener: ln, srv: s})
 		if err == http.ErrServerClosed {
@@ -120,8 +139,9 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 	s.transport = transport
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL.Scheme = s.cfg.BackendURL.Scheme
-			pr.Out.URL.Host = s.cfg.BackendURL.Host
+			backend := s.nextBackend()
+			pr.Out.URL.Scheme = backend.Scheme
+			pr.Out.URL.Host = backend.Host
 			// Preserve the client-supplied authority instead of the backend's.
 			pr.Out.Host = pr.In.Host
 			// ReverseProxy re-adds "Te: trailers"; the contract removes Te always.
@@ -137,7 +157,7 @@ func (s *Server) newReverseProxy() *httputil.ReverseProxy {
 		// Every relayed backend status is recorded with the request ID so
 		// interleaved concurrent outcomes stay unambiguous (FR-013).
 		ModifyResponse: func(resp *http.Response) error {
-			s.logf("event=response id=%s status=%d", requestIDFrom(resp.Request.Context()), resp.StatusCode)
+			s.logf("event=response id=%s backend=%s status=%d", requestIDFrom(resp.Request.Context()), resp.Request.URL.Host, resp.StatusCode)
 			return nil
 		},
 		// Forwarding failures stay isolated to their own request: a client
